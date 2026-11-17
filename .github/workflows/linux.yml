@@ -1,0 +1,307 @@
+
+# AISTVM: bounded Linux development/debug session, not persistent hosting.
+# GitHub-hosted jobs have a maximum lifetime of 360 minutes. No renew/re-dispatch loop.
+name: AISTVM Linux development session
+run-name: "AISTVM Linux | aistuser"
+on:
+  workflow_dispatch:
+permissions:
+  contents: write
+  actions: write
+concurrency:
+  group: aistvm-linux-session
+  cancel-in-progress: false
+jobs:
+  linux-session:
+    name: Linux development/debug
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      AISTVM_USERNAME: "aistuser"
+      AISTVM_DURATION_MINUTES: "15"
+      AISTVM_WORKSPACE: "/home/runner/aistvm-workspace"
+    steps:
+      - name: Establish hard job deadline
+        run: |
+          set -euo pipefail
+          # Reserve one minute for cleanup before this job's own timeout.
+          deadline=$(date -u -d "+$((25 - 1)) minutes" +%Y-%m-%dT%H:%M:%SZ)
+          echo "AISTVM_JOB_DEADLINE=$deadline" >> "$GITHUB_ENV"
+          # The session budget is charged from the moment the run starts, so the
+          # minutes spent building the machine count towards the same duration
+          # the user selected (identical to the Windows session model).
+          session_deadline=$(date -u -d "+15 minutes" +%Y-%m-%dT%H:%M:%SZ)
+          echo "AISTVM_SESSION_DEADLINE=$session_deadline" >> "$GITHUB_ENV"
+
+      - name: Check out terminal agent
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Configure private terminal and Tailscale
+        id: prepare
+        timeout-minutes: 8
+        env:
+          AISTVM_RDP_PASSWORD: ${{ secrets.AISTVM_RDP_PASSWORD }}
+          TAILSCALE_AUTH_KEY: ${{ secrets.AISTVM_TAILSCALE_AUTH_KEY }}
+          AISTVM_TERMINAL_TOKEN: ${{ secrets.AISTVM_TERMINAL_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Never print environment variables, secrets or keys.
+          stage='starting'
+          report_failure() {
+            # Surface which stage failed without echoing any secret.
+            echo "Linux setup failed at '$stage': $1"
+            echo 'Check the Tailscale auth key/device approval and the selected runner image.'
+          }
+          trap 'report_failure "unexpected error"' ERR
+          username="$AISTVM_USERNAME"
+          if [[ ! "$username" =~ ^[a-z_][a-z0-9_-]{2,31}$ ]]; then
+            report_failure 'Invalid Linux username.'
+            exit 1
+          fi
+          password="$AISTVM_RDP_PASSWORD"
+          if [[ ${#password} -lt 12 || ${#password} -gt 127 ]]; then
+            report_failure 'RDP password length is out of range.'
+            exit 1
+          fi
+          if [[ ! "$password" =~ [A-Z] || ! "$password" =~ [a-z] || ! "$password" =~ [0-9] || ! "$password" =~ [^A-Za-z0-9] ]]; then
+            report_failure 'RDP password does not meet the security policy.'
+            exit 1
+          fi
+          if [[ "$password" == *"$username"* ]]; then
+            report_failure 'RDP password must not contain the username.'
+            exit 1
+          fi
+          if [[ ! "$AISTVM_TERMINAL_TOKEN" =~ ^[A-Za-z0-9_-]{20,}$ ]]; then
+            report_failure 'The terminal token is missing or malformed.'
+            exit 1
+          fi
+          if id "$username" >/dev/null 2>&1; then
+            report_failure 'Refusing to modify an existing Linux user.'
+            exit 1
+          fi
+
+          stage='starting firewall'
+          sudo ufw --force reset >/dev/null 2>&1 || true
+          sudo ufw default deny incoming >/dev/null 2>&1 || true
+          sudo ufw default allow outgoing >/dev/null 2>&1 || true
+
+          stage='creating Linux user'
+          sudo useradd --create-home --shell /bin/bash "$username"
+          echo "$username:$password" | sudo chpasswd
+          echo "AISTVM_CREATED_USER=$username" >> "$GITHUB_ENV"
+          sudo mkdir -p "$AISTVM_WORKSPACE"
+          sudo chown "$username:$username" "$AISTVM_WORKSPACE"
+
+          stage='granting full sudo'
+          # The owner asked for full root inside the throwaway machine. Grant
+          # passwordless sudo explicitly; do not rely on the default sudo group
+          # membership, which may still prompt for the password.
+          echo "$username ALL=(ALL) NOPASSWD:ALL" | sudo tee /etc/sudoers.d/aistvm-session >/dev/null
+          sudo chmod 0440 /etc/sudoers.d/aistvm-session
+          sudo visudo -cf /etc/sudoers.d/aistvm-session >/dev/null
+
+          stage='configuring shell prompt'
+          # Give the login shell a branded AISTVM prompt with real colour, an
+          # on-login banner and colour for ls/grep, so the console looks like a
+          # normal terminal instead of a bare "$". The system bashrc is sourced
+          # FIRST because it sets its own PS1; ours is applied after so it wins.
+          # The workspace already belongs to the session user, so write the file
+          # through sudo tee instead of a plain redirect (the job runs as
+          # runner, which no longer owns it).
+          printf '%s\n'             '[ -f /etc/bash.bashrc ] && . /etc/bash.bashrc'             'export HOME="/home/runner/aistvm-workspace"'             'export TERM="xterm-256color"'             'export COLORTERM="truecolor"'             'export CLICOLOR=1'             'export LS_COLORS="di=1;34:ln=1;36:so=1;35:pi=33:ex=1;32:bd=1;33:cd=1;33:su=1;31:sg=1;30:*.zip=1;31:*.tar=1;31:*.gz=1;31"'             'alias ls="ls --color=auto"'             'alias ll="ls -alF --color=auto"'             'alias la="ls -A --color=auto"'             'alias l="ls -CF --color=auto"'             'alias grep="grep --color=auto"'             'alias fgrep="fgrep --color=auto"'             'alias egrep="egrep --color=auto"'             'export PS1="\[\e[1;32m\]aistvm\[\e[0m\] \[\e[1;34m\]\w\[\e[0m\] \[\e[1;32m\]❯\[\e[0m\] "'             'export PROMPT_COMMAND=""'             'if [[ $- == *i* ]]; then'             '  printf "\n\033[1;32m  AISTVM\033[0m \033[2m·\033[0m \033[1;37mmáy Linux tạm thời\033[0m\n"'             '  printf "\033[2m  Shell thật (PTY) · gõ lệnh như VPS · gõ \033[0m\033[1;33mexit\033[0m\033[2m để thoát\033[0m\n\n"'             'fi'             | sudo tee "$AISTVM_WORKSPACE/.bash_profile" >/dev/null
+          sudo chown "$username:$username" "$AISTVM_WORKSPACE/.bash_profile"
+
+          stage='installing Tailscale'
+          curl -fsSL https://tailscale.com/install.sh | sh
+          if ! command -v tailscale >/dev/null 2>&1; then
+            report_failure 'The Tailscale CLI was not installed.'
+            exit 1
+          fi
+
+          stage='starting Tailscale daemon'
+          # The apt package ships a systemd unit; make sure the local API
+          # answers before "up", otherwise "up" fails with a socket error.
+          if ! sudo tailscale status --json >/dev/null 2>&1; then
+            sudo systemctl enable --now tailscaled >/dev/null 2>&1 || true
+            for attempt in $(seq 1 30); do
+              if sudo tailscale status --json >/dev/null 2>&1; then break; fi
+              if [[ $attempt -eq 30 ]]; then
+                report_failure 'The Tailscale daemon did not become ready.'
+                exit 1
+              fi
+              sleep 1
+            done
+          fi
+
+          stage='connecting Tailscale'
+          # The "unattended" flag is Windows-only and is not defined on the
+          # Linux CLI, so it must not be passed here. --accept-risk=lose-ssh is
+          # required when running "tailscale up" over SSH without a TTY.
+          auth_output=$(sudo tailscale up --auth-key="$TAILSCALE_AUTH_KEY" --accept-risk=lose-ssh --accept-dns=false --accept-routes=false --hostname="aistvm-linux-$GITHUB_RUN_ID" --timeout=90s 2>&1) || {
+            auth_detail="${auth_output//$TAILSCALE_AUTH_KEY/[redacted]}"
+            report_failure "Tailscale authentication failed: ${auth_detail:0:500}"
+            exit 1
+          }
+          auth_output=''
+          status_output=$(sudo tailscale status --json)
+          backend=$(echo "$status_output" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("BackendState",""))')
+          if [[ "$backend" != 'Running' ]]; then
+            report_failure 'Tailscale is not Running; device approval may be required.'
+            exit 1
+          fi
+          ip=$(echo "$status_output" | python3 -c 'import json,sys
+          data = json.load(sys.stdin)
+          for address in data.get("TailscaleIPs", []):
+              parts = address.split(".")
+              if len(parts) == 4 and parts[0] == "100" and 64 <= int(parts[1]) <= 127:
+                  print(address)
+                  break')
+          if [[ -z "$ip" ]]; then
+            report_failure 'No valid Tailscale IPv4 address.'
+            exit 1
+          fi
+          echo "ip=$ip" >> "$GITHUB_OUTPUT"
+
+          stage='allowing tailnet access'
+          # Only the Tailscale CIDR may reach the terminal port. Everything else
+          # stays denied by the default policy above.
+          sudo ufw allow from 100.64.0.0/10 to any port 8790 proto tcp >/dev/null
+          sudo ufw --force enable >/dev/null
+
+          stage='starting terminal agent'
+          agent="$GITHUB_WORKSPACE/aistvm-terminal-agent.py"
+          if [[ ! -f "$agent" ]]; then
+            report_failure 'The terminal agent source is missing.'
+            exit 1
+          fi
+          sudo env AISTVM_TERMINAL_PORT="8790" AISTVM_TERMINAL_TOKEN="$AISTVM_TERMINAL_TOKEN" AISTVM_LINUX_USER="$username" AISTVM_WORKSPACE="$AISTVM_WORKSPACE" \
+            nohup python3 "$agent" >"$RUNNER_TEMP/aistvm-terminal.log" 2>&1 &
+          echo "AISTVM_AGENT_SOURCE=$agent" >> "$GITHUB_ENV"
+
+          stage='verifying terminal agent'
+          for attempt in $(seq 1 30); do
+            if curl -fsS "http://127.0.0.1:8790/health" >/dev/null 2>&1; then
+              break
+            fi
+            if [[ $attempt -eq 30 ]]; then
+              report_failure 'The terminal agent health check timed out.'
+              exit 1
+            fi
+            sleep 1
+          done
+          ready_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          echo "ready_at=$ready_at" >> "$GITHUB_OUTPUT"
+          unset password AISTVM_RDP_PASSWORD TAILSCALE_AUTH_KEY AISTVM_TERMINAL_TOKEN auth_output status_output
+
+      - name: "Linux ready | ${{ steps.prepare.outputs.ip }} | ${{ steps.prepare.outputs.ready_at }}"
+        id: readiness
+        env:
+          AISTVM_READY_AT: ${{ steps.prepare.outputs.ready_at }}
+          AISTVM_READY_IP: ${{ steps.prepare.outputs.ip }}
+          AISTVM_TERMINAL_TOKEN: ${{ secrets.AISTVM_TERMINAL_TOKEN }}
+        run: |
+          set -euo pipefail
+          status_output=$(sudo tailscale status --json)
+          backend=$(echo "$status_output" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("BackendState",""))')
+          if [[ "$backend" != 'Running' ]]; then
+            echo 'Tailscale is not Running.'
+            exit 1
+          fi
+          if ! echo "$status_output" | grep -q "$AISTVM_READY_IP"; then
+            echo 'The expected Tailscale address is missing.'
+            exit 1
+          fi
+          health=$(curl -fsS "http://$AISTVM_READY_IP:8790/health" -H "Authorization: Bearer $AISTVM_TERMINAL_TOKEN" || true)
+          if [[ "$health" != *'"ok": true'* && "$health" != *'"ok":true'* ]]; then
+            echo 'The terminal agent is not healthy over Tailscale.'
+            exit 1
+          fi
+          ready_at=$(date -u -d "$AISTVM_READY_AT" +%s)
+          # Keep the session budget that started with the job (build time counts),
+          # but never let it outlive the job's own hard deadline.
+          session_deadline=$(date -u -d "$AISTVM_SESSION_DEADLINE" +%s)
+          job_deadline=$(date -u -d "$AISTVM_JOB_DEADLINE" +%s)
+          if [[ $job_deadline -lt $session_deadline ]]; then
+            deadline=$job_deadline
+          else
+            deadline=$session_deadline
+          fi
+          if [[ $deadline -le $(date -u +%s) ]]; then
+            echo 'Job deadline reached during setup.'
+            exit 1
+          fi
+          echo "AISTVM_SESSION_DEADLINE=$deadline" >> "$GITHUB_ENV"
+          echo "AISTVM_READY_EPOCH=$ready_at" >> "$GITHUB_ENV"
+          echo 'Private terminal and Tailscale Running state verified.'
+
+      - name: Remove all temporary workflow sources after startup
+        if: ${{ success() }}
+        env:
+          # AISTVM_WORKFLOW_CLEANUP_TOKEN should be a classic PAT with repo +
+          # workflow scopes, or a fine-grained token with Contents: write and
+          # Workflows: write. github.token is only a best-effort fallback.
+          AISTVM_GITHUB_TOKEN: ${{ secrets.AISTVM_WORKFLOW_CLEANUP_TOKEN || github.token }}
+        run: |
+          set -euo pipefail
+          headers=(-H "Accept: application/vnd.github+json" -H "Authorization: Bearer $AISTVM_GITHUB_TOKEN" -H "X-GitHub-Api-Version: 2022-11-28")
+          base="https://api.github.com/repos/$GITHUB_REPOSITORY/contents"
+          ref=$(python3 -c 'import os,urllib.parse; print(urllib.parse.quote(os.environ["GITHUB_REF_NAME"]))')
+          workflow_files=$(curl -fsS "${headers[@]}" "$base/.github/workflows?ref=$ref" || echo '[]')
+          for entry in $(echo "$workflow_files" | python3 -c 'import json,sys
+          try:
+              items = json.load(sys.stdin)
+          except Exception:
+              items = []
+          for item in items:
+              if item.get("type") == "file" and item.get("sha"):
+                  print(item["url"] + "|" + item["sha"])'); do
+            file_url="${entry%%|*}"; sha="${entry##*|}"
+            body=$(python3 -c 'import json,sys; print(json.dumps({"message":"Remove temporary AISTVM workflow source after startup","sha":sys.argv[1],"branch":sys.argv[2]}))' "$sha" "$GITHUB_REF_NAME")
+            curl -fsS "${headers[@]}" -X DELETE -H 'Content-Type: application/json' -d "$body" "$file_url" >/dev/null || true
+          done
+          agent=$(curl -fsS "${headers[@]}" "$base/aistvm-terminal-agent.py?ref=$ref" || true)
+          if [[ -n "$agent" ]]; then
+            sha=$(echo "$agent" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("sha",""))')
+            url=$(echo "$agent" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("url",""))')
+            if [[ -n "$sha" && -n "$url" ]]; then
+              body=$(python3 -c 'import json,sys; print(json.dumps({"message":"Remove temporary AISTVM terminal source after startup","sha":sys.argv[1],"branch":sys.argv[2]}))' "$sha" "$GITHUB_REF_NAME")
+              curl -fsS "${headers[@]}" -X DELETE -H 'Content-Type: application/json' -d "$body" "$url" >/dev/null || true
+            fi
+          fi
+          echo 'Temporary setup files removed after startup.'
+
+      - name: Bounded development/debug session
+        run: |
+          set -euo pipefail
+          deadline=$AISTVM_SESSION_DEADLINE
+          while [[ $(date -u +%s) -lt $deadline ]]; do
+            remaining=$((deadline - $(date -u +%s)))
+            echo "Development/debug heartbeat; $remaining seconds remain. No automatic renewal."
+            if [[ $remaining -lt 60 ]]; then sleep $((remaining > 0 ? remaining : 1)); else sleep 60; fi
+            backend=$(sudo tailscale status --json | python3 -c 'import json,sys; print(json.load(sys.stdin).get("BackendState",""))')
+            if [[ "$backend" != 'Running' ]]; then
+              echo 'Tailscale disconnected.'
+              exit 1
+            fi
+            if [[ -n "${AISTVM_AGENT_SOURCE:-}" ]] && ! pgrep -f -- "$AISTVM_AGENT_SOURCE" >/dev/null; then
+              echo 'The terminal agent stopped.'
+              exit 1
+            fi
+          done
+
+      - name: Cleanup Linux session
+        if: ${{ always() }}
+        timeout-minutes: 2
+        run: |
+          set -uo pipefail
+          if [[ -n "${AISTVM_AGENT_SOURCE:-}" ]]; then
+            sudo pkill -f -- "$AISTVM_AGENT_SOURCE" 2>/dev/null || true
+          fi
+          sudo tailscale logout 2>/dev/null || true
+          sudo ufw --force disable 2>/dev/null || true
+          if [[ -n "${AISTVM_CREATED_USER:-}" ]] && id "$AISTVM_CREATED_USER" >/dev/null 2>&1; then
+            sudo userdel -r "$AISTVM_CREATED_USER" 2>/dev/null || true
+          fi
+          echo 'Tailscale logged out and the temporary Linux account removed.'
